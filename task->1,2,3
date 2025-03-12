@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Fetch metadata
+TOKEN=$(curl -X PUT -sH "X-aws-ec2-metadata-token-ttl-seconds: 21600" "http://169.254.169.254/latest/api/token")
+region=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/region")
+instance_id=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/instance-id")
+
+# Get EC2 Name Tag
+host_name=$(aws ec2 describe-tags --region $region --filters "Name=resource-id,Values=$instance_id" --query "Tags[?Key=='Name'].Value" --output text | tr -d '"')
+if [[ -z "$host_name" ]]; then host_name="batch2-server"; fi
+
+sudo hostnamectl set-hostname "$host_name"
+
+# Update /etc/hosts to reflect new hostname
+echo "127.0.0.1 $host_name" | sudo tee -a /etc/hosts > /dev/null
+
+# Set domain
+domain_name="dvstech.com"
+
+# Ensure hosted zone exists or create it
+hosted_zone_id=$(aws route53 list-hosted-zones --query "HostedZones[?Name=='$domain_name.'].Id" --output text | cut -d'/' -f3)
+if [[ -z "$hosted_zone_id" ]]; then
+    echo "ERROR: Private hosted zone missing!"
+    exit 1
+fi
+
+# Get private IP
+private_ip=$(aws ec2 describe-instances --instance-ids $instance_id --region $region --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
+
+# Create Route 53 DNS record JSON file
+cat > /tmp/route53-record.json <<EOF
+{
+    "Comment": "Register instance in Route 53",
+    "Changes": [
+        {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "$host_name.$domain_name.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [
+                    { "Value": "$private_ip" }
+                ]
+            }
+        }
+    ]
+}
+EOF
+
+# Register instance in Route 53
+aws route53 change-resource-record-sets --hosted-zone-id $hosted_zone_id --change-batch file:///tmp/route53-record.json
+
+# Install and configure Apache
+sudo yum install -y httpd
+sudo systemctl start httpd
+sudo systemctl enable httpd
+
+# Create index.html with message
+echo "Hi This is from $host_name " | sudo tee /var/www/html/index.html > /dev/null
+
+# Restart Apache to apply changes
+sudo systemctl restart httpd
+
+# Print success message
+echo "Successfully registered $host_name.$domain_name -> $private_ip in Route 53 and configured web server."
